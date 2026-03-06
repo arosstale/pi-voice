@@ -1,0 +1,10 @@
+{
+  "name": "@artale/pi-voice",
+  "version": "1.0.0",
+  "description": "Voice input for pi. Record audio, transcribe with Whisper (Groq/OpenAI), return text.",
+  "keywords": ["pi-package", "pi-extension", "voice", "speech", "whisper", "transcription"],
+  "license": "MIT",
+  "author": "artale",
+  "repository": { "type": "git", "url": "https://github.com/arosstale/pi-voice.git" },
+  "extensions": ["extensions/pi-voice.ts"]
+}
