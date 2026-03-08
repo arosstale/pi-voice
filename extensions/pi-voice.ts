@@ -116,7 +116,7 @@ function transcribeWithOpenAI(audioFile: string): string | null {
 export default function piVoice(pi: ExtensionAPI) {
   pi.registerCommand("voice", {
     description: "Voice input. /voice [record|config|history]",
-    execute: async (ctx, args) => {
+    handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/);
       const sub = parts[0]?.toLowerCase() || "record";
 
@@ -232,7 +232,7 @@ export default function piVoice(pi: ExtensionAPI) {
     },
   });
 
-  pi.registerTool("voice_capture", {
+  pi.registerTool({ name: "voice_capture",
     description: "Record audio and transcribe to text. Requires SoX + GROQ_API_KEY or OPENAI_API_KEY.",
     parameters: Type.Object({
       seconds: Type.Optional(Type.Number({ description: "Recording duration in seconds (default: 10)" })),
