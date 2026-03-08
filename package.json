@@ -1,6 +1,6 @@
 {
   "name": "@artale/pi-voice",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Voice input for pi. Record audio, transcribe with Whisper (Groq/OpenAI), return text.",
   "keywords": [
     "pi-package",

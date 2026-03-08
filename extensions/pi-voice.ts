@@ -63,37 +63,82 @@ function recordAudio(seconds: number): string | null {
     } catch {}
   }
 
-  // Windows: try PowerShell audio recording
-  try {
-    const ps = `
-      Add-Type -AssemblyName System.Speech
-      $recognizer = New-Object System.Speech.Recognition.SpeechRecognitionEngine
-      $recognizer.SetInputToDefaultAudioDevice()
-      $grammar = New-Object System.Speech.Recognition.DictationGrammar
-      $recognizer.LoadGrammar($grammar)
-      $result = $recognizer.Recognize([TimeSpan]::FromSeconds(${seconds}))
-      if ($result) { $result.Text } else { "" }
-    `;
-    // This is a simplified approach — we'll note this needs SoX for full quality
-    return null;
-  } catch {}
+  // macOS: try afrecord
+  if (process.platform === "darwin") {
+    try {
+      execSync(`afrecord -d LEI16 -f WAVE -c 1 -r 16000 "${outFile}" &`, { timeout: 2000, stdio: "pipe" });
+      execSync(`sleep ${seconds}`, { timeout: (seconds + 2) * 1000, stdio: "pipe" });
+      execSync(`kill %1 2>/dev/null || true`, { timeout: 2000, stdio: "pipe" });
+      return outFile;
+    } catch {}
+  }
+
+  // Linux: try arecord (ALSA)
+  if (process.platform === "linux") {
+    try {
+      execSync(`arecord -f S16_LE -r 16000 -c 1 -d ${seconds} "${outFile}"`, { timeout: (seconds + 5) * 1000, stdio: "pipe" });
+      return outFile;
+    } catch {}
+  }
+
+  // Windows: try PowerShell NAudio or ffmpeg
+  if (process.platform === "win32") {
+    try {
+      execSync(`ffmpeg -y -f dshow -i audio="Microphone" -t ${seconds} -ar 16000 -ac 1 "${outFile}"`, { timeout: (seconds + 5) * 1000, stdio: "pipe" });
+      return outFile;
+    } catch {}
+  }
 
   return null;
+}
+
+function multipartUpload(url: string, apiKey: string, audioFile: string, model: string): Promise<string | null> {
+  const https = require("node:https");
+  const { URL } = require("node:url");
+  const audioData = readFileSync(audioFile);
+  const boundary = "----PiVoice" + Date.now();
+  
+  let body = "";
+  body += `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`;
+  body += `--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n`;
+  body += `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n`;
+  const footer = `\r\n--${boundary}--\r\n`;
+  
+  const headerBuf = Buffer.from(body, "utf-8");
+  const footerBuf = Buffer.from(footer, "utf-8");
+  const fullBody = Buffer.concat([headerBuf, audioData, footerBuf]);
+
+  const parsed = new URL(url);
+  return new Promise((resolve) => {
+    const req = https.request({
+      hostname: parsed.hostname, path: parsed.pathname, method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": fullBody.length,
+      }
+    }, (res: any) => {
+      let data = "";
+      res.on("data", (c: Buffer) => data += c);
+      res.on("end", () => { try { resolve(JSON.parse(data).text || null); } catch { resolve(null); } });
+    });
+    req.on("error", () => resolve(null));
+    req.setTimeout(30000, () => { req.destroy(); resolve(null); });
+    req.write(fullBody);
+    req.end();
+  });
 }
 
 function transcribeWithGroq(audioFile: string): string | null {
   const key = process.env.GROQ_API_KEY;
   if (!key) return null;
+  // Use sync wrapper around async multipart upload
   try {
     const result = execSync(
-      `curl -sL "https://api.groq.com/openai/v1/audio/transcriptions" ` +
-      `-H "Authorization: Bearer ${key}" ` +
-      `-F "model=whisper-large-v3-turbo" ` +
-      `-F "file=@${audioFile}" ` +
-      `-F "response_format=json"`,
+      `node -e "const https=require('https');const fs=require('fs');const d=fs.readFileSync('${audioFile.replace(/\\/g, "\\\\")}');const b='----B'+Date.now();let body='--'+b+'\\r\\nContent-Disposition: form-data; name=\"model\"\\r\\n\\r\\nwhisper-large-v3-turbo\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"response_format\"\\r\\n\\r\\njson\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n';const h=Buffer.from(body);const f=Buffer.from('\\r\\n--'+b+'--\\r\\n');const full=Buffer.concat([h,d,f]);const r=https.request({hostname:'api.groq.com',path:'/openai/v1/audio/transcriptions',method:'POST',headers:{'Authorization':'Bearer ${key}','Content-Type':'multipart/form-data; boundary='+b,'Content-Length':full.length}},res=>{let s='';res.on('data',c=>s+=c);res.on('end',()=>console.log(JSON.parse(s).text||''))});r.on('error',()=>{});r.write(full);r.end()"`,
       { encoding: "utf-8", timeout: 30000 }
     );
-    return JSON.parse(result).text || null;
+    return result.trim() || null;
   } catch { return null; }
 }
 
@@ -102,14 +147,10 @@ function transcribeWithOpenAI(audioFile: string): string | null {
   if (!key) return null;
   try {
     const result = execSync(
-      `curl -sL "https://api.openai.com/v1/audio/transcriptions" ` +
-      `-H "Authorization: Bearer ${key}" ` +
-      `-F "model=whisper-1" ` +
-      `-F "file=@${audioFile}" ` +
-      `-F "response_format=json"`,
+      `node -e "const https=require('https');const fs=require('fs');const d=fs.readFileSync('${audioFile.replace(/\\/g, "\\\\")}');const b='----B'+Date.now();let body='--'+b+'\\r\\nContent-Disposition: form-data; name=\"model\"\\r\\n\\r\\nwhisper-1\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"response_format\"\\r\\n\\r\\njson\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n';const h=Buffer.from(body);const f=Buffer.from('\\r\\n--'+b+'--\\r\\n');const full=Buffer.concat([h,d,f]);const r=https.request({hostname:'api.openai.com',path:'/v1/audio/transcriptions',method:'POST',headers:{'Authorization':'Bearer ${key}','Content-Type':'multipart/form-data; boundary='+b,'Content-Length':full.length}},res=>{let s='';res.on('data',c=>s+=c);res.on('end',()=>console.log(JSON.parse(s).text||''))});r.on('error',()=>{});r.write(full);r.end()"`,
       { encoding: "utf-8", timeout: 30000 }
     );
-    return JSON.parse(result).text || null;
+    return result.trim() || null;
   } catch { return null; }
 }
 
