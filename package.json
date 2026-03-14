@@ -1,14 +1,18 @@
 {
   "name": "@artale/pi-voice",
-  "version": "1.1.1",
-  "description": "Voice input for pi. Record audio, transcribe with Whisper (Groq/OpenAI), return text.",
+  "version": "2.0.0",
+  "description": "Voice input for Pi. Multi-provider STT with Deepgram streaming, Groq Whisper, OpenAI Whisper. 56+ languages.",
   "keywords": [
     "pi-package",
     "pi-extension",
     "voice",
     "speech",
     "whisper",
-    "transcription"
+    "deepgram",
+    "transcription",
+    "stt",
+    "streaming",
+    "dictation"
   ],
   "license": "MIT",
   "author": "artale",

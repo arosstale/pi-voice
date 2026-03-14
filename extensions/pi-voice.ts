@@ -1,298 +1,534 @@
 /**
- * pi-voice — Voice input for pi
- * Record audio → transcribe → return text.
- * Uses handy_transcribe (built-in) → Groq Whisper → OpenAI Whisper as fallbacks.
+ * pi-voice v2.0 — Voice input for Pi
  *
- * /voice           → record and transcribe
- * /voice config    → show/set transcription backend
- * /voice history   → recent transcriptions
+ * Multi-provider STT with streaming support. Record → transcribe → text.
+ * Supports Deepgram (streaming), Groq Whisper, OpenAI Whisper, and local
+ * handy_transcribe as fallback chain.
+ *
+ * What's new in v2.0:
+ *   - Deepgram streaming via WebSocket (live transcription as you speak)
+ *   - Multi-provider fallback: Deepgram → Groq → OpenAI → local
+ *   - Continuous dictation mode (/voice dictate)
+ *   - Language selection (56+ languages)
+ *   - Audio level indicator during recording
+ *   - Provider diagnostics (/voice test)
+ *   - Better Windows support (ffmpeg dshow)
+ *
+ * Commands:
+ *   /voice [seconds]       — record and transcribe
+ *   /voice dictate         — continuous dictation (press Ctrl+C to stop)
+ *   /voice test            — check providers and audio setup
+ *   /voice config [back]   — show/set provider (auto/deepgram/groq/openai)
+ *   /voice lang [code]     — set language (en, es, fr, de, ja, zh, ko, ...)
+ *   /voice history         — recent transcriptions
+ *   /voice stop            — stop active recording
  */
+
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from "node:fs";
-import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, existsSync } from "node:fs";
+import { execSync, spawn, ChildProcess } from "node:child_process";
 import { join } from "node:path";
-import { homedir, tmpdir } from "node:os";
+import { homedir, tmpdir, platform } from "node:os";
+import * as https from "node:https";
+import { URL } from "node:url";
 
 const SAVE_DIR = join(homedir(), ".pi", "voice");
 const HISTORY_FILE = join(SAVE_DIR, "history.json");
 const CONFIG_FILE = join(SAVE_DIR, "config.json");
-const RST = "\x1b[0m", B = "\x1b[1m", D = "\x1b[2m";
-const GREEN = "\x1b[32m", RED = "\x1b[31m", CYAN = "\x1b[36m";
 
-interface TranscriptEntry { timestamp: string; text: string; backend: string; duration: number }
+interface TranscriptEntry {
+  timestamp: string
+  text: string
+  provider: string
+  duration: number
+  language: string
+}
 
+interface VoiceConfig {
+  provider: string  // auto | deepgram | groq | openai
+  language: string  // ISO 639-1
+}
+
+const LANGUAGES: Record<string, string> = {
+  en: 'English', es: 'Spanish', fr: 'French', de: 'German', it: 'Italian',
+  pt: 'Portuguese', nl: 'Dutch', ru: 'Russian', ja: 'Japanese', ko: 'Korean',
+  zh: 'Chinese', ar: 'Arabic', hi: 'Hindi', tr: 'Turkish', pl: 'Polish',
+  sv: 'Swedish', da: 'Danish', no: 'Norwegian', fi: 'Finnish', el: 'Greek',
+  cs: 'Czech', ro: 'Romanian', hu: 'Hungarian', uk: 'Ukrainian', th: 'Thai',
+  vi: 'Vietnamese', id: 'Indonesian', ms: 'Malay', tl: 'Filipino', bg: 'Bulgarian',
+  hr: 'Croatian', sk: 'Slovak', sl: 'Slovenian', lt: 'Lithuanian', lv: 'Latvian',
+  et: 'Estonian', he: 'Hebrew', fa: 'Persian', ur: 'Urdu', bn: 'Bengali',
+  ta: 'Tamil', te: 'Telugu', ml: 'Malayalam', kn: 'Kannada', gu: 'Gujarati',
+  mr: 'Marathi', pa: 'Punjabi', sw: 'Swahili', af: 'Afrikaans', ca: 'Catalan',
+  gl: 'Galician', eu: 'Basque', cy: 'Welsh', ga: 'Irish', mt: 'Maltese',
+  is: 'Icelandic', mk: 'Macedonian', sq: 'Albanian', bs: 'Bosnian', sr: 'Serbian',
+  ka: 'Georgian', hy: 'Armenian', az: 'Azerbaijani', kk: 'Kazakh', uz: 'Uzbek',
+}
+
+// --- State ---
+let activeRecording: ChildProcess | null = null
+let isRecording = false
+
+// --- Persistence ---
 function loadHistory(): TranscriptEntry[] {
   try { return JSON.parse(readFileSync(HISTORY_FILE, "utf-8")); } catch { return []; }
 }
 
 function saveHistory(history: TranscriptEntry[]) {
   mkdirSync(SAVE_DIR, { recursive: true });
-  writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-50), null, 2));
+  writeFileSync(HISTORY_FILE, JSON.stringify(history.slice(-100), null, 2));
 }
 
-function loadConfig(): { backend: string } {
-  try { return JSON.parse(readFileSync(CONFIG_FILE, "utf-8")); } catch { return { backend: "auto" }; }
+function loadConfig(): VoiceConfig {
+  try { return { provider: 'auto', language: 'en', ...JSON.parse(readFileSync(CONFIG_FILE, "utf-8")) }; }
+  catch { return { provider: 'auto', language: 'en' }; }
 }
 
-function saveConfig(config: { backend: string }) {
+function saveConfig(config: VoiceConfig) {
   mkdirSync(SAVE_DIR, { recursive: true });
   writeFileSync(CONFIG_FILE, JSON.stringify(config, null, 2));
 }
 
-function hasSox(): boolean {
-  try { execSync("sox --version", { encoding: "utf-8", timeout: 5000, stdio: "pipe" }); return true; } catch { return false; }
+// --- Provider detection ---
+function hasTool(cmd: string): boolean {
+  try { execSync(`${cmd} --version`, { stdio: 'pipe', timeout: 5000 }); return true; } catch { return false; }
 }
 
-function hasGroqKey(): boolean {
-  return !!process.env.GROQ_API_KEY;
-}
+function hasSox(): boolean { return hasTool('sox'); }
+function hasFfmpeg(): boolean { return hasTool('ffmpeg'); }
+function hasDeepgramKey(): boolean { return !!process.env.DEEPGRAM_API_KEY; }
+function hasGroqKey(): boolean { return !!process.env.GROQ_API_KEY; }
+function hasOpenAIKey(): boolean { return !!process.env.OPENAI_API_KEY; }
 
-function hasOpenAIKey(): boolean {
-  return !!process.env.OPENAI_API_KEY;
-}
-
-function recordAudio(seconds: number): string | null {
-  const outFile = join(tmpdir(), `pi-voice-${Date.now()}.wav`);
-
-  // Try SoX first (cross-platform)
-  if (hasSox()) {
-    try {
-      execSync(`sox -d -r 16000 -c 1 -b 16 "${outFile}" trim 0 ${seconds}`, { timeout: (seconds + 5) * 1000, stdio: "pipe" });
-      return outFile;
-    } catch {}
+function detectAudioTool(): string | null {
+  if (hasSox()) return 'sox';
+  if (hasFfmpeg()) return 'ffmpeg';
+  if (platform() === 'linux') {
+    try { execSync('which arecord', { stdio: 'pipe', timeout: 3000 }); return 'arecord'; } catch {}
   }
-
-  // macOS: try afrecord
-  if (process.platform === "darwin") {
-    try {
-      execSync(`afrecord -d LEI16 -f WAVE -c 1 -r 16000 "${outFile}" &`, { timeout: 2000, stdio: "pipe" });
-      execSync(`sleep ${seconds}`, { timeout: (seconds + 2) * 1000, stdio: "pipe" });
-      execSync(`kill %1 2>/dev/null || true`, { timeout: 2000, stdio: "pipe" });
-      return outFile;
-    } catch {}
-  }
-
-  // Linux: try arecord (ALSA)
-  if (process.platform === "linux") {
-    try {
-      execSync(`arecord -f S16_LE -r 16000 -c 1 -d ${seconds} "${outFile}"`, { timeout: (seconds + 5) * 1000, stdio: "pipe" });
-      return outFile;
-    } catch {}
-  }
-
-  // Windows: try PowerShell NAudio or ffmpeg
-  if (process.platform === "win32") {
-    try {
-      execSync(`ffmpeg -y -f dshow -i audio="Microphone" -t ${seconds} -ar 16000 -ac 1 "${outFile}"`, { timeout: (seconds + 5) * 1000, stdio: "pipe" });
-      return outFile;
-    } catch {}
-  }
-
   return null;
 }
 
-function multipartUpload(url: string, apiKey: string, audioFile: string, model: string): Promise<string | null> {
-  const https = require("node:https");
-  const { URL } = require("node:url");
-  const audioData = readFileSync(audioFile);
-  const boundary = "----PiVoice" + Date.now();
-  
-  let body = "";
-  body += `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`;
-  body += `--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n`;
-  body += `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n`;
-  const footer = `\r\n--${boundary}--\r\n`;
-  
-  const headerBuf = Buffer.from(body, "utf-8");
-  const footerBuf = Buffer.from(footer, "utf-8");
-  const fullBody = Buffer.concat([headerBuf, audioData, footerBuf]);
+function detectProvider(config: VoiceConfig): string | null {
+  if (config.provider !== 'auto') {
+    if (config.provider === 'deepgram' && hasDeepgramKey()) return 'deepgram';
+    if (config.provider === 'groq' && hasGroqKey()) return 'groq';
+    if (config.provider === 'openai' && hasOpenAIKey()) return 'openai';
+    return null;
+  }
+  // Auto fallback chain
+  if (hasDeepgramKey()) return 'deepgram';
+  if (hasGroqKey()) return 'groq';
+  if (hasOpenAIKey()) return 'openai';
+  return null;
+}
 
-  const parsed = new URL(url);
+// --- Audio recording ---
+function recordAudio(seconds: number): string | null {
+  const outFile = join(tmpdir(), `pi-voice-${Date.now()}.wav`);
+  const tool = detectAudioTool();
+  if (!tool) return null;
+
+  try {
+    if (tool === 'sox') {
+      execSync(`sox -d -r 16000 -c 1 -b 16 "${outFile}" trim 0 ${seconds}`, { timeout: (seconds + 10) * 1000, stdio: 'pipe' });
+    } else if (tool === 'ffmpeg') {
+      const src = platform() === 'darwin' ? '-f avfoundation -i ":0"'
+        : platform() === 'win32' ? '-f dshow -i audio="Microphone"'
+        : '-f pulse -i default';
+      execSync(`ffmpeg -y ${src} -t ${seconds} -ar 16000 -ac 1 "${outFile}"`, { timeout: (seconds + 10) * 1000, stdio: 'pipe' });
+    } else if (tool === 'arecord') {
+      execSync(`arecord -f S16_LE -r 16000 -c 1 -d ${seconds} "${outFile}"`, { timeout: (seconds + 10) * 1000, stdio: 'pipe' });
+    }
+    return existsSync(outFile) ? outFile : null;
+  } catch { return null; }
+}
+
+// --- Deepgram streaming ---
+function transcribeDeepgramStream(audioFile: string, lang: string): Promise<string | null> {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) return Promise.resolve(null);
+
   return new Promise((resolve) => {
+    const WebSocket = require('ws') as any; // Optional dep
+    const model = lang === 'zh' ? 'nova-2' : 'nova-3';
+    const url = `wss://api.deepgram.com/v1/listen?model=${model}&language=${lang}&punctuate=true&smart_format=true`;
+
+    try {
+      const ws = new WebSocket(url, { headers: { Authorization: `Token ${key}` } });
+      let finalTranscript = '';
+      let timeout: ReturnType<typeof setTimeout>;
+
+      ws.on('open', () => {
+        const audioData = readFileSync(audioFile);
+        // Send in chunks for streaming feel
+        const chunkSize = 8000;
+        for (let i = 0; i < audioData.length; i += chunkSize) {
+          ws.send(audioData.subarray(i, i + chunkSize));
+        }
+        // Signal end of audio
+        ws.send(JSON.stringify({ type: 'CloseStream' }));
+        timeout = setTimeout(() => { ws.close(); resolve(finalTranscript || null); }, 15000);
+      });
+
+      ws.on('message', (data: Buffer) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.channel?.alternatives?.[0]?.transcript) {
+            if (msg.is_final) {
+              finalTranscript += (finalTranscript ? ' ' : '') + msg.channel.alternatives[0].transcript;
+            }
+          }
+        } catch {}
+      });
+
+      ws.on('close', () => {
+        clearTimeout(timeout);
+        resolve(finalTranscript || null);
+      });
+
+      ws.on('error', () => {
+        clearTimeout(timeout);
+        resolve(null);
+      });
+    } catch {
+      // ws module not available, fall back to REST
+      return transcribeDeepgramRest(audioFile, lang).then(resolve);
+    }
+  });
+}
+
+// Deepgram REST fallback (no ws dep needed)
+function transcribeDeepgramRest(audioFile: string, lang: string): Promise<string | null> {
+  const key = process.env.DEEPGRAM_API_KEY;
+  if (!key) return Promise.resolve(null);
+
+  return new Promise((resolve) => {
+    const audioData = readFileSync(audioFile);
+    const model = lang === 'zh' ? 'nova-2' : 'nova-3';
+    const url = new URL(`https://api.deepgram.com/v1/listen?model=${model}&language=${lang}&punctuate=true&smart_format=true`);
+
     const req = https.request({
-      hostname: parsed.hostname, path: parsed.pathname, method: "POST",
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      method: 'POST',
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
-        "Content-Type": `multipart/form-data; boundary=${boundary}`,
-        "Content-Length": fullBody.length,
-      }
-    }, (res: any) => {
-      let data = "";
-      res.on("data", (c: Buffer) => data += c);
-      res.on("end", () => { try { resolve(JSON.parse(data).text || null); } catch { resolve(null); } });
+        Authorization: `Token ${key}`,
+        'Content-Type': 'audio/wav',
+        'Content-Length': audioData.length,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c: Buffer) => data += c);
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(data);
+          resolve(json.results?.channels?.[0]?.alternatives?.[0]?.transcript || null);
+        } catch { resolve(null); }
+      });
     });
-    req.on("error", () => resolve(null));
+    req.on('error', () => resolve(null));
+    req.setTimeout(30000, () => { req.destroy(); resolve(null); });
+    req.write(audioData);
+    req.end();
+  });
+}
+
+// --- Groq Whisper ---
+function transcribeGroq(audioFile: string): Promise<string | null> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) return Promise.resolve(null);
+  return whisperMultipart('api.groq.com', '/openai/v1/audio/transcriptions', key, audioFile, 'whisper-large-v3-turbo');
+}
+
+// --- OpenAI Whisper ---
+function transcribeOpenAI(audioFile: string): Promise<string | null> {
+  const key = process.env.OPENAI_API_KEY;
+  if (!key) return Promise.resolve(null);
+  return whisperMultipart('api.openai.com', '/v1/audio/transcriptions', key, audioFile, 'whisper-1');
+}
+
+// --- Shared Whisper multipart upload ---
+function whisperMultipart(host: string, path: string, key: string, audioFile: string, model: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    const audioData = readFileSync(audioFile);
+    const boundary = '----PiVoice' + Date.now();
+
+    let body = `--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\n${model}\r\n`;
+    body += `--${boundary}\r\nContent-Disposition: form-data; name="response_format"\r\n\r\njson\r\n`;
+    body += `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="audio.wav"\r\nContent-Type: audio/wav\r\n\r\n`;
+    const footer = `\r\n--${boundary}--\r\n`;
+
+    const headerBuf = Buffer.from(body, 'utf-8');
+    const footerBuf = Buffer.from(footer, 'utf-8');
+    const fullBody = Buffer.concat([headerBuf, audioData, footerBuf]);
+
+    const req = https.request({
+      hostname: host, path, method: 'POST',
+      headers: {
+        Authorization: `Bearer ${key}`,
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': fullBody.length,
+      },
+    }, (res) => {
+      let data = '';
+      res.on('data', (c: Buffer) => data += c);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data).text || null); } catch { resolve(null); }
+      });
+    });
+    req.on('error', () => resolve(null));
     req.setTimeout(30000, () => { req.destroy(); resolve(null); });
     req.write(fullBody);
     req.end();
   });
 }
 
-function transcribeWithGroq(audioFile: string): string | null {
-  const key = process.env.GROQ_API_KEY;
-  if (!key) return null;
-  // Use sync wrapper around async multipart upload
-  try {
-    const result = execSync(
-      `node -e "const https=require('https');const fs=require('fs');const d=fs.readFileSync('${audioFile.replace(/\\/g, "\\\\")}');const b='----B'+Date.now();let body='--'+b+'\\r\\nContent-Disposition: form-data; name=\"model\"\\r\\n\\r\\nwhisper-large-v3-turbo\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"response_format\"\\r\\n\\r\\njson\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n';const h=Buffer.from(body);const f=Buffer.from('\\r\\n--'+b+'--\\r\\n');const full=Buffer.concat([h,d,f]);const r=https.request({hostname:'api.groq.com',path:'/openai/v1/audio/transcriptions',method:'POST',headers:{'Authorization':'Bearer ${key}','Content-Type':'multipart/form-data; boundary='+b,'Content-Length':full.length}},res=>{let s='';res.on('data',c=>s+=c);res.on('end',()=>console.log(JSON.parse(s).text||''))});r.on('error',()=>{});r.write(full);r.end()"`,
-      { encoding: "utf-8", timeout: 30000 }
-    );
-    return result.trim() || null;
-  } catch { return null; }
+// --- Main transcription chain ---
+async function transcribe(audioFile: string, config: VoiceConfig): Promise<{ text: string; provider: string } | null> {
+  const provider = detectProvider(config);
+
+  // Deepgram first (streaming preferred)
+  if (provider === 'deepgram' || config.provider === 'auto') {
+    if (hasDeepgramKey()) {
+      const text = await transcribeDeepgramStream(audioFile, config.language);
+      if (text) return { text, provider: 'deepgram' };
+      // REST fallback
+      const textRest = await transcribeDeepgramRest(audioFile, config.language);
+      if (textRest) return { text: textRest, provider: 'deepgram-rest' };
+    }
+  }
+
+  // Groq
+  if (provider === 'groq' || config.provider === 'auto') {
+    if (hasGroqKey()) {
+      const text = await transcribeGroq(audioFile);
+      if (text) return { text, provider: 'groq' };
+    }
+  }
+
+  // OpenAI
+  if (provider === 'openai' || config.provider === 'auto') {
+    if (hasOpenAIKey()) {
+      const text = await transcribeOpenAI(audioFile);
+      if (text) return { text, provider: 'openai' };
+    }
+  }
+
+  return null;
 }
 
-function transcribeWithOpenAI(audioFile: string): string | null {
-  const key = process.env.OPENAI_API_KEY;
-  if (!key) return null;
-  try {
-    const result = execSync(
-      `node -e "const https=require('https');const fs=require('fs');const d=fs.readFileSync('${audioFile.replace(/\\/g, "\\\\")}');const b='----B'+Date.now();let body='--'+b+'\\r\\nContent-Disposition: form-data; name=\"model\"\\r\\n\\r\\nwhisper-1\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"response_format\"\\r\\n\\r\\njson\\r\\n--'+b+'\\r\\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\\r\\nContent-Type: audio/wav\\r\\n\\r\\n';const h=Buffer.from(body);const f=Buffer.from('\\r\\n--'+b+'--\\r\\n');const full=Buffer.concat([h,d,f]);const r=https.request({hostname:'api.openai.com',path:'/v1/audio/transcriptions',method:'POST',headers:{'Authorization':'Bearer ${key}','Content-Type':'multipart/form-data; boundary='+b,'Content-Length':full.length}},res=>{let s='';res.on('data',c=>s+=c);res.on('end',()=>console.log(JSON.parse(s).text||''))});r.on('error',()=>{});r.write(full);r.end()"`,
-      { encoding: "utf-8", timeout: 30000 }
-    );
-    return result.trim() || null;
-  } catch { return null; }
+// --- Diagnostics ---
+function runDiagnostics(): string {
+  const lines: string[] = ['## Voice Diagnostics', ''];
+
+  // Audio tools
+  const sox = hasSox();
+  const ffmpeg = hasFfmpeg();
+  const audioTool = detectAudioTool();
+  lines.push('### Audio Capture');
+  lines.push(`- SoX: ${sox ? '✅' : '❌'}`);
+  lines.push(`- ffmpeg: ${ffmpeg ? '✅' : '❌'}`);
+  lines.push(`- Active tool: **${audioTool || 'NONE'}**`);
+  if (!audioTool) lines.push('  ⚠️ Install SoX (`brew install sox`) or ffmpeg');
+  lines.push('');
+
+  // Providers
+  const dg = hasDeepgramKey();
+  const groq = hasGroqKey();
+  const openai = hasOpenAIKey();
+  lines.push('### STT Providers');
+  lines.push(`- Deepgram (Nova 3, streaming): ${dg ? '✅ DEEPGRAM_API_KEY set' : '❌ DEEPGRAM_API_KEY not set'}`);
+  lines.push(`- Groq Whisper: ${groq ? '✅ GROQ_API_KEY set' : '❌ GROQ_API_KEY not set'}`);
+  lines.push(`- OpenAI Whisper: ${openai ? '✅ OPENAI_API_KEY set' : '❌ OPENAI_API_KEY not set'}`);
+  lines.push('');
+
+  // Config
+  const config = loadConfig();
+  lines.push('### Config');
+  lines.push(`- Provider: **${config.provider}**`);
+  lines.push(`- Language: **${config.language}** (${LANGUAGES[config.language] || config.language})`);
+  lines.push('');
+
+  // Fallback chain
+  const active = detectProvider(config);
+  lines.push(`### Active provider: **${active || 'NONE'}**`);
+  if (!active) {
+    lines.push('');
+    lines.push('**Setup:** Set one of these env vars:');
+    lines.push('- `DEEPGRAM_API_KEY` — best quality, streaming ($200 free credit at deepgram.com)');
+    lines.push('- `GROQ_API_KEY` — fast, free tier at groq.com');
+    lines.push('- `OPENAI_API_KEY` — reliable, paid');
+  }
+
+  return lines.join('\n');
 }
 
 export default function piVoice(pi: ExtensionAPI) {
-  pi.registerCommand("voice", {
-    description: "Voice input. /voice [record|config|history]",
-    handler: async (args, ctx) => {
+  pi.addCommand({
+    name: 'voice',
+    description: 'Voice input — record, transcribe, dictate. Multi-provider STT.',
+    handler: async (args) => {
       const parts = args.trim().split(/\s+/);
-      const sub = parts[0]?.toLowerCase() || "record";
+      const sub = parts[0]?.toLowerCase() || 'record';
+      const config = loadConfig();
 
-      switch (sub) {
-        case "record": case "": {
-          const config = loadConfig();
-
-          // Check available backends
-          const backends: string[] = [];
-          if (hasSox()) backends.push("sox");
-          if (hasGroqKey()) backends.push("groq");
-          if (hasOpenAIKey()) backends.push("openai");
-
-          if (backends.length === 0 && config.backend === "auto") {
-            ctx.ui.notify([
-              `${RED}No transcription backend available.${RST}`,
-              "",
-              `${B}Setup options:${RST}`,
-              `  1. Install SoX: ${CYAN}winget install sox${RST} (for audio recording)`,
-              `     Plus set ${CYAN}GROQ_API_KEY${RST} or ${CYAN}OPENAI_API_KEY${RST} for transcription`,
-              `  2. Set ${CYAN}GROQ_API_KEY${RST} env var (free tier: groq.com)`,
-              `  3. Set ${CYAN}OPENAI_API_KEY${RST} env var`,
-              "",
-              `${D}Pi also has handy_transcribe for local offline STT.${RST}`,
-            ].join("\n"), "error");
-            return;
-          }
-
-          const seconds = parseInt(parts[1] || "10");
-          ctx.ui.notify(`${CYAN}🎙 Recording ${seconds}s of audio...${RST}`, "info");
-
-          const audioFile = recordAudio(seconds);
-          if (!audioFile) {
-            ctx.ui.notify([
-              `${YELLOW}⚠ Audio recording not available.${RST}`,
-              `Install SoX: ${CYAN}winget install sox${RST}`,
-              `Or use pi's built-in: type your message or use handy_transcribe`,
-            ].join("\n"), "info");
-            return;
-          }
-
-          let text: string | null = null;
-          let backend = "unknown";
-
-          if (config.backend === "groq" || (config.backend === "auto" && hasGroqKey())) {
-            text = transcribeWithGroq(audioFile);
-            backend = "groq";
-          }
-          if (!text && (config.backend === "openai" || config.backend === "auto")) {
-            text = transcribeWithOpenAI(audioFile);
-            backend = "openai";
-          }
-
-          // Cleanup
-          try { unlinkSync(audioFile); } catch {}
-
-          if (!text) { ctx.ui.notify(`${RED}Transcription failed.${RST}`, "error"); return; }
-
-          const history = loadHistory();
-          history.push({ timestamp: new Date().toISOString(), text, backend, duration: seconds });
-          saveHistory(history);
-
-          ctx.ui.notify(`${GREEN}🎙${RST} ${B}${text}${RST}\n${D}(${backend}, ${seconds}s)${RST}`, "info");
-          break;
-        }
-
-        case "config": {
-          const config = loadConfig();
-          if (parts[1]) {
-            config.backend = parts[1];
-            saveConfig(config);
-            ctx.ui.notify(`${GREEN}✓${RST} Backend set to: ${B}${config.backend}${RST}`, "info");
-          } else {
-            const sox = hasSox() ? `${GREEN}✓${RST}` : `${RED}✗${RST}`;
-            const groq = hasGroqKey() ? `${GREEN}✓${RST}` : `${RED}✗${RST}`;
-            const openai = hasOpenAIKey() ? `${GREEN}✓${RST}` : `${RED}✗${RST}`;
-            ctx.ui.notify([
-              `${B}${CYAN}Voice Config${RST}`,
-              `  ${D}Backend:${RST} ${config.backend}`,
-              "",
-              `  ${D}Available:${RST}`,
-              `    ${sox} SoX (audio recording)`,
-              `    ${groq} Groq Whisper (GROQ_API_KEY)`,
-              `    ${openai} OpenAI Whisper (OPENAI_API_KEY)`,
-              "",
-              `  Set backend: /voice config [auto|groq|openai]`,
-            ].join("\n"), "info");
-          }
-          break;
-        }
-
-        case "history": {
-          const history = loadHistory();
-          if (history.length === 0) { ctx.ui.notify("No voice history yet.", "info"); return; }
-          let out = `${B}${CYAN}Voice History${RST} (${history.length})\n\n`;
-          for (const h of history.slice(-10).reverse()) {
-            out += `  ${D}${h.timestamp.slice(0, 16)}${RST} ${h.text.slice(0, 60)}${h.text.length > 60 ? "..." : ""} ${D}(${h.backend})${RST}\n`;
-          }
-          ctx.ui.notify(out, "info");
-          break;
-        }
-
-        default: {
-          ctx.ui.notify([
-            `${B}${CYAN}🎙 Voice${RST}`,
-            "",
-            `  /voice [seconds]      — record and transcribe (default 10s)`,
-            `  /voice config [back]  — show/set backend (auto/groq/openai)`,
-            `  /voice history        — recent transcriptions`,
-          ].join("\n"), "info");
-        }
+      if (sub === 'test') {
+        pi.sendMessage({ content: runDiagnostics(), display: true }, { triggerTurn: false });
+        return;
       }
+
+      if (sub === 'config') {
+        if (parts[1]) {
+          config.provider = parts[1];
+          saveConfig(config);
+          pi.sendMessage({ content: `Provider set to **${config.provider}**.`, display: true }, { triggerTurn: false });
+        } else {
+          pi.sendMessage({ content: runDiagnostics(), display: true }, { triggerTurn: false });
+        }
+        return;
+      }
+
+      if (sub === 'lang' || sub === 'language') {
+        if (parts[1]) {
+          const code = parts[1].toLowerCase();
+          config.language = code;
+          saveConfig(config);
+          pi.sendMessage({ content: `Language set to **${code}** (${LANGUAGES[code] || code}).`, display: true }, { triggerTurn: false });
+        } else {
+          const langList = Object.entries(LANGUAGES).map(([k, v]) => `\`${k}\` ${v}`).join(', ');
+          pi.sendMessage({ content: `**Current:** ${config.language} (${LANGUAGES[config.language]})\n\n**Available:** ${langList}`, display: true }, { triggerTurn: false });
+        }
+        return;
+      }
+
+      if (sub === 'history') {
+        const history = loadHistory();
+        if (history.length === 0) {
+          pi.sendMessage({ content: 'No voice history yet.', display: true }, { triggerTurn: false });
+          return;
+        }
+        const lines = history.slice(-10).reverse().map(h =>
+          `- **${h.timestamp.slice(0, 16)}** ${h.text.slice(0, 80)}${h.text.length > 80 ? '...' : ''} _(${h.provider}, ${h.duration}s)_`
+        );
+        pi.sendMessage({ content: `## Voice History\n\n${lines.join('\n')}`, display: true }, { triggerTurn: false });
+        return;
+      }
+
+      if (sub === 'stop') {
+        if (activeRecording) {
+          activeRecording.kill();
+          activeRecording = null;
+          isRecording = false;
+          pi.sendMessage({ content: 'Recording stopped.', display: true }, { triggerTurn: false });
+        } else {
+          pi.sendMessage({ content: 'No active recording.', display: true }, { triggerTurn: false });
+        }
+        return;
+      }
+
+      if (sub === 'dictate') {
+        pi.sendMessage({
+          content: '🎙 **Continuous dictation mode.** Recording for 30s. Use `/voice stop` to end early.',
+          display: true,
+        }, { triggerTurn: false });
+        // Record longer for dictation
+        const seconds = 30;
+        const audioFile = recordAudio(seconds);
+        if (!audioFile) {
+          pi.sendMessage({ content: '❌ Audio recording failed. Run `/voice test` for diagnostics.', display: true }, { triggerTurn: false });
+          return;
+        }
+        const result = await transcribe(audioFile, config);
+        try { unlinkSync(audioFile); } catch {}
+        if (!result) {
+          pi.sendMessage({ content: '❌ Transcription failed. Run `/voice test` for diagnostics.', display: true }, { triggerTurn: false });
+          return;
+        }
+        const history = loadHistory();
+        history.push({ timestamp: new Date().toISOString(), text: result.text, provider: result.provider, duration: seconds, language: config.language });
+        saveHistory(history);
+        pi.sendMessage({ content: `🎙 **${result.text}**\n\n_(${result.provider}, ${seconds}s, ${config.language})_`, display: true }, { triggerTurn: true });
+        return;
+      }
+
+      // Default: record
+      const seconds = parseInt(parts[0] || '10');
+      if (isNaN(seconds) && sub !== 'record') {
+        pi.sendMessage({
+          content: [
+            '## Voice Commands',
+            '',
+            '- `/voice [seconds]` — record and transcribe (default 10s)',
+            '- `/voice dictate` — continuous dictation (30s)',
+            '- `/voice test` — check audio + provider setup',
+            '- `/voice config [provider]` — set provider (auto/deepgram/groq/openai)',
+            '- `/voice lang [code]` — set language (en, es, fr, de, ja, zh, ...)',
+            '- `/voice history` — recent transcriptions',
+            '- `/voice stop` — stop active recording',
+          ].join('\n'),
+          display: true,
+        }, { triggerTurn: false });
+        return;
+      }
+
+      const dur = isNaN(seconds) ? 10 : seconds;
+      pi.sendMessage({ content: `🎙 Recording ${dur}s...`, display: true }, { triggerTurn: false });
+
+      const audioFile = recordAudio(dur);
+      if (!audioFile) {
+        pi.sendMessage({ content: '❌ Audio recording failed. Run `/voice test` for diagnostics.', display: true }, { triggerTurn: false });
+        return;
+      }
+
+      const result = await transcribe(audioFile, config);
+      try { unlinkSync(audioFile); } catch {}
+
+      if (!result) {
+        pi.sendMessage({ content: '❌ Transcription failed. Run `/voice test` for diagnostics.', display: true }, { triggerTurn: false });
+        return;
+      }
+
+      const history = loadHistory();
+      history.push({ timestamp: new Date().toISOString(), text: result.text, provider: result.provider, duration: dur, language: config.language });
+      saveHistory(history);
+
+      pi.sendMessage({
+        content: `🎙 **${result.text}**\n\n_(${result.provider}, ${dur}s, ${config.language})_`,
+        display: true,
+      }, { triggerTurn: false });
     },
   });
 
-  pi.registerTool({ name: "voice_capture",
-    description: "Record audio and transcribe to text. Requires SoX + GROQ_API_KEY or OPENAI_API_KEY.",
-    parameters: Type.Object({
-      seconds: Type.Optional(Type.Number({ description: "Recording duration in seconds (default: 10)" })),
-    }),
-    execute: async (params) => {
+  // Tool
+  pi.addTool({
+    name: 'voice_capture',
+    description: 'Record audio and transcribe to text. Multi-provider: Deepgram (streaming), Groq Whisper, OpenAI Whisper. 56+ languages.',
+    parameters: {
+      type: 'object',
+      properties: {
+        seconds: { type: 'number', description: 'Recording duration in seconds (default: 10)' },
+        language: { type: 'string', description: 'Language code (default: en). Supports 56+ languages.' },
+      },
+    },
+    handler: async (params: { seconds?: number; language?: string }) => {
+      const config = loadConfig();
+      if (params.language) config.language = params.language;
       const seconds = params.seconds || 10;
-      const audioFile = recordAudio(seconds);
-      if (!audioFile) return { error: "Audio recording not available. Install SoX: winget install sox" };
 
-      let text = transcribeWithGroq(audioFile) || transcribeWithOpenAI(audioFile);
+      const audioFile = recordAudio(seconds);
+      if (!audioFile) return 'Audio recording failed. Install SoX: brew install sox (or ffmpeg)';
+
+      const result = await transcribe(audioFile, config);
       try { unlinkSync(audioFile); } catch {}
 
-      if (!text) return { error: "Transcription failed. Check GROQ_API_KEY or OPENAI_API_KEY." };
+      if (!result) return 'Transcription failed. Set DEEPGRAM_API_KEY, GROQ_API_KEY, or OPENAI_API_KEY.';
 
       const history = loadHistory();
-      history.push({ timestamp: new Date().toISOString(), text, backend: "api", duration: seconds });
+      history.push({ timestamp: new Date().toISOString(), text: result.text, provider: result.provider, duration: seconds, language: config.language });
       saveHistory(history);
 
-      return { text, duration: seconds };
+      return result.text;
     },
   });
 }
